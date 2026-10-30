@@ -273,6 +273,14 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "invalid JSON body", "type": "bad_request"}})
             return
 
+        # 上游 Z.AI 限制 tools 最多 64 条，超出直接截断（否则 413）
+        if parsed is not None and path == "/v1/chat/completions":
+            tools = parsed.get("tools")
+            if isinstance(tools, list) and len(tools) > 64:
+                parsed["tools"] = tools[:64]
+                body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+                LOG.warning("tools truncated to 64 entries (was %d)", len(tools))
+
         # 节流（最便宜的降封手段）
         t0 = time.time()
         st.guard.acquire(key)
