@@ -112,12 +112,7 @@ resp = client.chat.completions.create(
 网关检测到后：**停手、记录、不自动重试、不换号、不换区域**。
 内容层面的判定换任何手段都不会改变结果，唯一正确做法是回到内容本身。
 
-### 4.5 tools 上限截断
-
-上游（Z.AI）限制 `tools` 数组最多 64 条。网关在转发前检测到超出时
-自动截断到前 64 条并记录日志，避免上游直接返回 `HTTP 413: tools must contain at most 64 entries`。
-
-### 4.6 日志脱敏
+### 4.5 日志脱敏
 
 `relay.py` 的 `log_message` 只保留请求行，不落 `Authorization` / `Cookie` / 请求体。
 凭证只存在于 `config.json`（本地文件，别提交到仓库）。

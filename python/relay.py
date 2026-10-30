@@ -141,7 +141,7 @@ class RelayState:
 
         # 2) 按 priority 从高到低尝试所有 enabled 账号
         for name in sorted(self.accounts.enabled_names(),
-                           key=lambda n: self.accounts.get(n, {}).get("priority", 0),
+                           key=lambda n: (self.accounts.get(n) or {}).get("priority", 0),
                            reverse=True):
             blocked, reason = self.guard.is_blocked(name)
             if not blocked:
