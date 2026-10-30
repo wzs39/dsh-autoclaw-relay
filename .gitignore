@@ -4,3 +4,14 @@ __pycache__/
 *.bak
 node_modules/
 .DS_Store
+
+# 敏感配置与运行数据
+config.json
+data/
+*.log
+
+# Python
+*.pyc
+*.egg-info/
+.venv/
+venv/
