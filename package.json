@@ -1,0 +1,44 @@
+{
+  "name": "dsh-autoclaw-relay",
+  "version": "1.0.0",
+  "description": "把 AutoClaw 防封中继网关（本地 Python relay）注册成 DSH 模型提供方：指纹收敛、节流抖动、冷却状态机、内容哨兵、日志脱敏五层降封机制全部在网关内生效；插件负责 relay 进程托管、模型目录接入与请求侧防封（session-title 本地短路、静态模型目录零上游轮询、冷却期不重试、并发闸门、密钥不落日志）。",
+  "license": "MIT",
+  "author": "qwe",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "autoclaw",
+    "relay",
+    "model-provider",
+    "anti-ban"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "engines": {
+      "dsh": "^0.1.5-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.1"
+    }
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.1",
+    "@deepseek-ai/dsh-llm": "^0.1.5-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1 || ^0.2.1-rc.1",
+    "@deepseek-ai/schemastery": ">=3.18.1"
+  },
+  "files": [
+    "lib",
+    "python",
+    "cordis.patch.yml",
+    "README.md"
+  ]
+}

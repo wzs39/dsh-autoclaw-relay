@@ -1,0 +1,39 @@
+{
+  "_comment": "AutoClaw 反代网关配置。所有字段都可被环境变量覆盖：AC_RELAY_* 见 README。",
+  "listen": "127.0.0.1:8080",
+  "server_header": "AutoClawRelay",
+  "gateway_key": "sk-local-change-me",
+  "account_key": "default",
+  "max_body_mb": 32,
+  "upstream_timeout_s": 300,
+  "verify_upstream": false,
+  "models_cache_ttl_s": 300,
+  "state_path": "./data/guard-state.json",
+  "upstream": {
+    "mode": "model-proxy",
+    "base": "http://127.0.0.1:7890/internal/model-proxy",
+    "path_prefix": "/v1",
+    "path_map": {},
+    "fallback_on_406": true,
+    "direct_mode": "model-proxy",
+    "fallback_mode": "relay"
+  },
+  "headers": {
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "origin": "https://autoclaw.z.ai",
+    "referer": "https://autoclaw.z.ai/",
+    "cookie": "",
+    "authorization": ""
+  },
+  "guard": {
+    "cooldown_balance_exhausted": 43200,
+    "cooldown_rate_limited": 60,
+    "cooldown_repeated_errors": 600,
+    "error_threshold": 3,
+    "cooldown_content_blocked": 900,
+    "cooldown_auth_failed": null,
+    "min_interval_ms": 1500,
+    "max_interval_ms": 6000
+  }
+}
