@@ -85,7 +85,7 @@ def normalize_headers(incoming, cfg: dict, stream: bool = False) -> dict:
     out["User-Agent"] = hdrs.get("user_agent") or cfg.get("user_agent") or DEFAULT_UA
     out["Accept"] = "text/event-stream" if stream else "application/json"
     out["Accept-Language"] = hdrs.get("accept_language") or cfg.get("accept_language") or "zh-CN,zh;q=0.9,en;q=0.8"
-    out["Accept-Encoding"] = "gzip, deflate, br"
+    out["Accept-Encoding"] = "identity"
     out["Content-Type"] = "application/json"
     out["Connection"] = "close"
 

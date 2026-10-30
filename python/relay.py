@@ -440,8 +440,13 @@ class RelayHandler(BaseHTTPRequestHandler):
         ctype = get_header(resp_headers, "Content-Type", "application/json")
         self.send_response(status)
         for k, v in strip_response_headers(resp_headers).items():
-            if k.lower() == "content-type":
+            lk = k.lower()
+            if lk == "content-type":
                 ctype = v
+                continue
+            if lk == "content-length":
+                continue
+            self.send_header(k, v)
         if ctype.startswith("text/event-stream"):
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
