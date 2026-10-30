@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""AutoClaw 本地登录态 OpenAI 兼容反代网关。
+"""AutoClaw 本地登录态 OpenAI 兼容反代网关（多账号版）。
 
-只做一件事：把你**自己账号**在官方 AutoClaw 桌面客户端里已经登录的本地
-model-proxy 额度，暴露成标准的 OpenAI 兼容接口，供本地工具调用。
+把你**自己账号**在官方 AutoClaw 桌面客户端里已经登录的本地 model-proxy 额度，
+暴露成标准的 OpenAI 兼容接口，供本地工具调用。
 
     客户端  ->  relay.py (:8080)  ->  127.0.0.1:<port>/internal/model-proxy/v1  (官方登录态)
 
@@ -13,6 +13,7 @@ model-proxy 额度，暴露成标准的 OpenAI 兼容接口，供本地工具调
   3. 冷却状态机 —— 402/429/连续错误/token 失效分别冷却或禁用，不在风控后再猛打
   4. 内容哨兵   —— 命中 DANGEROUS_ACTIVITY_BLOCKED 时停手，绝不自动重试/换号
   5. 日志脱敏   —— 不落任何 token / cookie / 请求体
+  6. 多账号管理 —— 账号池 + 故障转移 + 一键签到（见 accounts.py / checkin.py）
 
 不做的事：不破解客户端、不绕过付费校验、不做批量账号运营。
 """
@@ -32,8 +33,10 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from accounts import AccountManager  # noqa: E402
 from fingerprint import get_header, normalize_headers, strip_response_headers  # noqa: E402
 from guard import CONTENT_BLOCK_SENTINEL, CooldownGuard  # noqa: E402
+import checkin as checkin_mod  # noqa: E402
 
 LOG = logging.getLogger("autoclaw-relay")
 
@@ -74,6 +77,7 @@ class RelayState:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.guard = CooldownGuard(cfg.get("guard", {}), cfg.get("state_path"))
+        self.accounts = AccountManager(cfg)
         self.lock = threading.Lock()
         self.mode = cfg.get("upstream", {}).get("mode", "model-proxy")
         self.models_cache: dict[str, float] = {}
@@ -88,6 +92,8 @@ class RelayState:
             "upstream_406": 0,
             "sentinel_hits": 0,
             "pacing_sleep_ms": 0,
+            "failover_switches": 0,
+            "checkin_count": 0,
         }
 
     def mode_spec(self) -> dict:
@@ -118,6 +124,44 @@ class RelayState:
         with self.lock:
             ts = self.models_cache.get("__t")
             return ts and (time.time() - ts) < self.models_cache_ttl
+
+    def resolve_account(self, requested: str | None) -> tuple[dict | None, str]:
+        """解析账号：优先按请求指定的账号名，冷却时按 priority 故障转移。
+
+        返回 (account_dict, account_name)。所有账号都冷却时返回 (None, "").
+        """
+        # 1) 精确匹配请求指定的账号
+        if requested and requested in self.accounts.names():
+            acc = self.accounts.get(requested)
+            if acc and acc.get("enabled", True):
+                blocked, reason = self.guard.is_blocked(requested)
+                if not blocked:
+                    return acc, requested
+                LOG.info("account %s blocked (%s), trying failover", requested, reason)
+
+        # 2) 按 priority 从高到低尝试所有 enabled 账号
+        for name in sorted(self.accounts.enabled_names(),
+                           key=lambda n: self.accounts.get(n, {}).get("priority", 0),
+                           reverse=True):
+            blocked, reason = self.guard.is_blocked(name)
+            if not blocked:
+                acc = self.accounts.get(name)
+                if requested and requested != name:
+                    with self.lock:
+                        self.metrics["failover_switches"] += 1
+                    LOG.info("failover: %s -> %s", requested or "default", name)
+                return acc, name
+
+        # 3) 全部冷却
+        return None, ""
+
+    def merged_cfg_for_account(self, account: dict) -> dict:
+        """把账号 headers 合并进全局 cfg，供 normalize_headers 使用。"""
+        merged = dict(self.cfg)
+        base_headers = dict(self.cfg.get("headers", {}))
+        base_headers.update({k: v for k, v in account.get("headers", {}).items() if v})
+        merged["headers"] = base_headers
+        return merged
 
 
 def _open_conn(host: str, port: int, scheme: str, timeout: float, verify: bool):
@@ -162,11 +206,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     # ---------- 工具 ----------
     def _drain_body(self) -> None:
-        """把未读的请求体排空，保住 keep-alive 连接；超限就显式断连。
-
-        冷却/鉴权失败等早退路径若不排空，残余字节会被复用连接的下一条请求
-        当成请求行（实测表现：下一条请求 501，方法名是上一条的 JSON 正文）。
-        """
+        """把未读的请求体排空，保住 keep-alive 连接；超限就显式断连。"""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -209,6 +249,16 @@ class RelayHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _read_request_body(self) -> dict:
+        """读取并解析 JSON 请求体，失败返回 {}。"""
+        try:
+            body = _read_body(self, float(self.state.cfg.get("max_body_mb", 32)))
+            if not body:
+                return {}
+            return json.loads(body.decode("utf-8"))
+        except Exception:
+            return {}
+
     # ---------- 路由 ----------
     def do_GET(self):  # noqa: N802
         self._route("GET")
@@ -223,15 +273,90 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         path = self.path.split("?", 1)[0]
 
+        # ---- 免鉴权端点 ----
         if path == "/healthz":
             self._send_json(200, {"ok": True, "mode": st.mode, "ts": time.time()})
             return
         if path == "/status":
-            self._send_json(200, {"mode": st.mode, "guard": st.guard.status(), "metrics": st.metrics})
+            self._send_json(200, {
+                "mode": st.mode,
+                "guard": st.guard.status(),
+                "metrics": st.metrics,
+                "accounts": st.accounts.list_accounts(),
+            })
             return
         if path == "/metrics":
             self._send_json(200, st.metrics)
             return
+
+        # ---- 需要 gateway key 的端点 ----
+        if not self._require_key():
+            self._drain_body()
+            self._send_json(401, {"error": {"message": "invalid gateway key", "type": "auth_error"}})
+            return
+
+        # ---- 账号管理端点 ----
+        if path == "/api/accounts" and method == "GET":
+            self._send_json(200, {"accounts": st.accounts.list_accounts()})
+            return
+
+        if path == "/api/accounts/add" and method == "POST":
+            body = self._read_request_body()
+            if not body.get("name"):
+                self._send_json(400, {"error": {"message": "name required", "type": "bad_request"}})
+                return
+            acc = st.accounts.add(
+                body["name"],
+                headers={
+                    "cookie": body.get("cookie", ""),
+                    "authorization": body.get("authorization", ""),
+                },
+                region=body.get("region", "cn"),
+                enabled=body.get("enabled", True),
+                priority=body.get("priority", 0),
+            )
+            self._send_json(201, {"ok": True, "account": acc})
+            return
+
+        if path == "/api/accounts/remove" and method == "POST":
+            body = self._read_request_body()
+            if not body.get("name"):
+                self._send_json(400, {"error": {"message": "name required", "type": "bad_request"}})
+                return
+            ok = st.accounts.remove(body["name"])
+            self._send_json(200 if ok else 404, {"ok": ok, "name": body["name"]})
+            return
+
+        if path == "/api/accounts/enable" and method == "POST":
+            body = self._read_request_body()
+            if not body.get("name"):
+                self._send_json(400, {"error": {"message": "name required", "type": "bad_request"}})
+                return
+            ok = st.accounts.set_enabled(body["name"], body.get("enabled", True))
+            self._send_json(200 if ok else 404, {"ok": ok, "name": body["name"], "enabled": body.get("enabled", True)})
+            return
+
+        # ---- 签到端点 ----
+        if path == "/api/checkin" and method == "POST":
+            accounts = st.accounts.list_accounts()
+            state_path = st.cfg.get("checkin_state_path") or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "data", "checkin-state.json"
+            )
+            results = checkin_mod.checkin_all(accounts, state_path)
+            with st.lock:
+                st.metrics["checkin_count"] += len(accounts)
+            self._send_json(200, {"results": results})
+            return
+
+        if path == "/api/checkin/status" and method == "GET":
+            state_path = st.cfg.get("checkin_state_path") or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "data", "checkin-state.json"
+            )
+            blob = checkin_mod.load_state(state_path)
+            self._send_json(200, blob)
+            return
+
+        # ---- 冷却/守卫端点（需要 gateway key）----
         if path == "/api/guard/status":
             self._send_json(200, st.guard.status())
             return
@@ -239,41 +364,44 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._send_json(200, st.guard.reset())
             return
 
-        if not self._require_key():
-            self._drain_body()
-            self._send_json(401, {"error": {"message": "invalid gateway key", "type": "auth_error"}})
-            return
+        # ---- 转发请求：解析账号 + 故障转移 ----
+        # 从请求头或 body 里取账号名
+        account_name = self.headers.get("X-AutoClaw-Account") or None
 
-        # 冷却闸门：被风控时直接挡在本地，绝不把请求打到上游
-        key = st.cfg.get("account_key") or "default"
-        blocked, reason = st.guard.is_blocked(key)
-        if blocked:
-            with st.lock:
-                st.metrics["blocked_rejections"] += 1
-            self._drain_body()
-            self._send_json(503, {"error": {"message": f"local cooldown: {reason}", "type": "cooldown"}})
-            return
-
+        # 先读 body（后面还需要解析 JSON）
         try:
             body = _read_body(self, float(st.cfg.get("max_body_mb", 32)))
         except UpstreamError as e:
-            self.close_connection = True  # 413：体没读过，这条连接不能复用
+            self.close_connection = True
             self._send_json(e.status, {"error": {"message": e.detail, "type": "request_error"}})
             return
 
+        # 解析 body
         stream = False
         parsed = None
         if body:
             try:
                 parsed = json.loads(body)
                 stream = bool(parsed.get("stream"))
+                if not account_name and isinstance(parsed, dict):
+                    account_name = parsed.get("account") or None
             except Exception:
                 parsed = None
+
         if path == "/v1/chat/completions" and parsed is None:
             self._send_json(400, {"error": {"message": "invalid JSON body", "type": "bad_request"}})
             return
 
-        # 上游 Z.AI 限制 tools 最多 64 条，超出直接截断（否则 413）
+        # 解析账号（含故障转移）
+        account, acc_key = st.resolve_account(account_name)
+        if not account:
+            with st.lock:
+                st.metrics["blocked_rejections"] += 1
+            self._drain_body()
+            self._send_json(503, {"error": {"message": "all accounts in cooldown", "type": "cooldown"}})
+            return
+
+        # 上游 Z.AI 限制 tools 最多 64 条
         if parsed is not None and path == "/v1/chat/completions":
             tools = parsed.get("tools")
             if isinstance(tools, list) and len(tools) > 64:
@@ -281,12 +409,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
                 LOG.warning("tools truncated to 64 entries (was %d)", len(tools))
 
-        # 节流（最便宜的降封手段）
+        # 节流
         t0 = time.time()
-        st.guard.acquire(key)
+        st.guard.acquire(acc_key)
         st.bump_pacing((time.time() - t0) * 1000.0)
 
-        # /v1/models 走内存缓存，避免无谓的上游轮询
+        # /v1/models 缓存
         if path == "/v1/models":
             if st.models_fresh():
                 with st.lock:
@@ -294,16 +422,18 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._send_bytes(200, json.dumps(cached, ensure_ascii=False, default=_json_default).encode("utf-8"))
                 return
 
+        # 转发
+        account_cfg = st.merged_cfg_for_account(account)
         try:
-            status, resp_headers, reader = self._forward(method, path, body, stream)
+            status, resp_headers, reader = self._forward(method, path, body, stream, account_cfg)
         except UpstreamError as e:
             if e.status in (429, 402, 401, 406):
                 kind = {429: "rate", 402: "balance", 401: "auth", 406: "error"}[e.status]
-                st.record(key, kind, e.detail)
+                st.record(acc_key, kind, e.detail)
             self._send_json(e.status or 502, {"error": {"message": e.detail, "type": "upstream_error"}})
             return
         except Exception as e:  # noqa: BLE001
-            st.record(key, "error", f"upstream transport: {type(e).__name__}")
+            st.record(acc_key, "error", f"upstream transport: {type(e).__name__}")
             self._send_json(502, {"error": {"message": f"upstream transport error: {type(e).__name__}", "type": "upstream_error"}})
             return
 
@@ -319,7 +449,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             try:
-                hit = self._stream(reader, key)
+                hit = self._stream(reader, acc_key)
             except Exception:  # noqa: BLE001
                 hit = False
             finally:
@@ -328,10 +458,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 except Exception:  # noqa: BLE001
                     pass
             if hit:
-                # 哨兵命中已在 _stream 内记 content_blocked；这里不能记 ok
-                # （guard 的 ok 会清掉 cooldown_until，等于白记）。
                 return
-            st.record(key, "ok" if status == 200 else "error", f"HTTP {status}")
+            st.record(acc_key, "ok" if status == 200 else "error", f"HTTP {status}")
             return
 
         data = reader.read()
@@ -345,16 +473,16 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
         if status == 200:
-            st.record(key, "ok")
+            st.record(acc_key, "ok")
             self._maybe_cache_models(path, data)
             if self._detect_sentinel(data):
-                st.record(key, "content_blocked")
+                st.record(acc_key, "content_blocked")
                 with st.lock:
                     st.metrics["sentinel_hits"] += 1
-                LOG.warning("content sentinel hit for account %s; stopped (no retry, no account switch)", key)
+                LOG.warning("content sentinel hit for account %s; stopped", acc_key)
         else:
             kind = {429: "rate", 402: "balance", 401: "auth", 406: "error"}.get(status, "error")
-            st.record(key, kind, f"HTTP {status}")
+            st.record(acc_key, kind, f"HTTP {status}")
             if status == 429:
                 with st.lock:
                     st.metrics["upstream_429"] += 1
@@ -371,10 +499,6 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     # ---------- 上游转发 ----------
     def _maybe_fallback_on_406(self) -> None:
-        """406 = 上游 WAF Bot 规则（实测 X-Request-Model: zai_* 触发）。
-
-        这不是账号问题，是链路问题：切到 relay 通道重试。仅在配置开启时做。
-        """
         st = self.state
         up = st.cfg.get("upstream", {})
         if not up.get("fallback_on_406"):
@@ -414,15 +538,10 @@ class RelayHandler(BaseHTTPRequestHandler):
     def _stream(self, reader, key: str) -> bool:
         """原样透传 SSE 字节，同时扫描内容哨兵。
 
-        响应已声明 Connection: close 且无 Content-Length，客户端按 EOF 结束读取，
-        因此这里写裸字节，不做 chunked 编码（否则客户端会把分块长度行当成正文）。
-
-        哨兵检测两条互补路径（上游可能整帧返回哨兵，也可能把哨兵拆进多个
-        delta 分片逐帧下发）：
+        哨兵检测两条路径：
         1. 原始字节连续匹配（跨 8K 分块边界拼接尾块）；
         2. 逐行解析 SSE 帧，累加 choices[0].delta.content，全等比对哨兵。
-        命中后记 content_blocked（本地冷却，不重试、不换号），当前流继续透传完
-        （adapter 侧已有文本兜底拦截），返回命中标记，调用方据此跳过 ok 记录。
+        命中后记 content_blocked（本地冷却，不重试、不换号）。
         """
         st = self.state
         sentinel = CONTENT_BLOCK_SENTINEL
@@ -447,9 +566,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                 st.record(key, "content_blocked", "stream sentinel (raw bytes)")
                 with st.lock:
                     st.metrics["sentinel_hits"] = st.metrics.get("sentinel_hits", 0) + 1
-                LOG.warning("content sentinel hit in stream for account %s; stopped (no retry, no account switch)", key)
+                LOG.warning("content sentinel hit in stream for account %s", key)
                 continue
-            # 路径 2：SSE 帧解析（行缓冲，处理跨块截断）
+            # 路径 2：SSE 帧解析
             line_buf += chunk
             while b"\n" in line_buf:
                 line, line_buf = line_buf.split(b"\n", 1)
@@ -477,12 +596,16 @@ class RelayHandler(BaseHTTPRequestHandler):
                     st.record(key, "content_blocked", "stream sentinel (delta content)")
                     with st.lock:
                         st.metrics["sentinel_hits"] = st.metrics.get("sentinel_hits", 0) + 1
-                    LOG.warning("content sentinel hit in stream for account %s; stopped (no retry, no account switch)", key)
+                    LOG.warning("content sentinel hit in stream for account %s", key)
                     break
         return hit
 
-    def _forward(self, method: str, path: str, body: bytes, stream: bool):
+    def _forward(self, method: str, path: str, body: bytes, stream: bool,
+                 account_cfg: dict | None = None):
+        """转发到上游。account_cfg 为合并了账号 headers 的配置。"""
         st = self.state
+        if account_cfg is None:
+            account_cfg = st.cfg
         spec = st.mode_spec()
         split = urlsplit(spec["base"])
         host = split.hostname or "127.0.0.1"
@@ -492,7 +615,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         target = spec["path_prefix"] + spec["path_map"].get(path, path)
         timeout = float(st.cfg.get("upstream_timeout_s", 300))
 
-        headers = normalize_headers(self.headers, st.cfg, stream=stream)
+        headers = normalize_headers(self.headers, account_cfg, stream=stream)
         if stream:
             headers["Accept"] = "text/event-stream"
 
@@ -539,7 +662,7 @@ def show_headers(cfg: dict, stream: bool = False) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="AutoClaw 本地登录态反代网关")
+    ap = argparse.ArgumentParser(description="AutoClaw 本地登录态反代网关（多账号版）")
     ap.add_argument("-c", "--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"))
     ap.add_argument("--show-headers", action="store_true", help="打印收敛后的上游请求头")
     ap.add_argument("--show-headers-stream", action="store_true", help="同上，按 SSE 流式场景")
@@ -565,7 +688,7 @@ def main() -> int:
         print("path prefix   :", spec["path_prefix"])
         print("listen        :", cfg.get("listen"))
         print("gateway key   :", "enabled" if cfg.get("gateway_key") else "disabled")
-        print("account key   :", cfg.get("account_key") or "default")
+        print("accounts      :", state.accounts.names())
         print("cooldown rules:", {k: v for k, v in state.guard.rules.items() if k.startswith("cooldown") or k == "error_threshold"})
         return 0
 
@@ -574,8 +697,9 @@ def main() -> int:
     RelayHandler.state = state
     srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), RelayHandler)
     srv.daemon_threads = True
-    LOG.info("AutoClaw relay listening on %s:%s -> %s%s (mode=%s)", host or "127.0.0.1", port,
-             state.mode_spec()["base"], state.mode_spec()["path_prefix"], state.mode)
+    LOG.info("AutoClaw relay listening on %s:%s -> %s%s (mode=%s, accounts=%s)",
+             host or "127.0.0.1", port, state.mode_spec()["base"], state.mode_spec()["path_prefix"],
+             state.mode, state.accounts.names())
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

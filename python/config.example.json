@@ -3,6 +3,7 @@
   "listen": "127.0.0.1:8080",
   "server_header": "AutoClawRelay",
   "gateway_key": "sk-local-change-me",
+  "checkin_state_path": "./data/checkin-state.json",
   "account_key": "default",
   "max_body_mb": 32,
   "upstream_timeout_s": 300,
@@ -35,5 +36,17 @@
     "cooldown_auth_failed": null,
     "min_interval_ms": 1500,
     "max_interval_ms": 6000
-  }
+  },
+  "accounts": [
+    {
+      "name": "default",
+      "region": "cn",
+      "enabled": true,
+      "priority": 0,
+      "headers": {
+        "cookie": "",
+        "authorization": ""
+      }
+    }
+  ]
 }
