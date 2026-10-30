@@ -172,6 +172,42 @@ def main() -> int:
     status, data = call("GET", "/status")
     print("[12] status:", status, data.decode("utf-8", "replace")[:200])
 
+    # ---- 多账号管理端点测试 ----
+    # [15] /api/accounts GET
+    status, data = call("GET", "/api/accounts")
+    print("[15] accounts list:", status, data.decode("utf-8", "replace")[:200])
+    ok &= status == 200
+
+    # [16] /api/accounts/add POST - 添加测试账号
+    status, data = call("POST", "/api/accounts/add",
+                        {"name": "test-acct", "region": "cn", "cookie": "test-cookie",
+                         "authorization": "Bearer test-token", "enabled": True, "priority": -1})
+    print("[16] accounts add:", status, data.decode("utf-8", "replace")[:160])
+    ok &= status == 201
+
+    # [17] /api/accounts/enable POST - 禁用测试账号
+    status, data = call("POST", "/api/accounts/enable",
+                        {"name": "test-acct", "enabled": False})
+    print("[17] accounts disable:", status, data.decode("utf-8", "replace")[:160])
+    ok &= status == 200
+
+    # [18] /api/accounts/enable POST - 重新启用
+    status, data = call("POST", "/api/accounts/enable",
+                        {"name": "test-acct", "enabled": True})
+    print("[18] accounts enable:", status, data.decode("utf-8", "replace")[:160])
+    ok &= status == 200
+
+    # [19] /api/checkin/status GET
+    status, data = call("GET", "/api/checkin/status")
+    print("[19] checkin status:", status, data.decode("utf-8", "replace")[:120])
+    ok &= status == 200
+
+    # [20] /api/accounts/remove POST - 清理测试账号
+    status, data = call("POST", "/api/accounts/remove",
+                        {"name": "test-acct"})
+    print("[20] accounts remove:", status, data.decode("utf-8", "replace")[:120])
+    ok &= status == 200
+
     print("\nRESULT:", "ALL PASS" if ok else "SOME FAILED")
     return 0 if ok else 1
 
