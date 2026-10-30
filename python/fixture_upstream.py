@@ -60,7 +60,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             text = body.decode("utf-8", "replace")
         except Exception:
             return ""
-        for m in ("waf406", "flaky", "sentinel", "balance", "auth", "rate"):
+        for m in ("waf406", "flaky", "sentinel-stream", "sentinel", "balance", "auth", "rate"):
             if f"[[fixture:{m}]]" in text:
                 return m
         return ""
@@ -108,6 +108,36 @@ class FixtureHandler(BaseHTTPRequestHandler):
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": SENTINEL}, "finish_reason": "stop"}],
             }
             self._send(200, payload)
+            return
+
+        if marker == "sentinel-stream":
+            # 流式哨兵：SSE 里逐块发哨兵串（每块 4 字节），哨兵跨分块边界，
+            # 验证中继的跨块拼接扫描。之后 end。
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            for i in range(0, len(SENTINEL), 4):
+                piece = SENTINEL[i:i + 4]
+                chunk = {
+                    "id": cid,
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                time.sleep(0.02)
+            done = {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+            self.wfile.write(f"data: {json.dumps(done, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
             return
 
         prompt = ""

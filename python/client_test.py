@@ -30,6 +30,24 @@ PORT = 8080
 KEY = "sk-local-change-me"
 
 
+def load_config():
+    """从本目录 config.json 读 listen / gateway_key（自测实例用独立端口）。"""
+    try:
+        with open("config.json", "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+CFG = load_config()
+if CFG:
+    _listen = str(CFG.get("listen", ""))
+    if ":" in _listen:
+        PORT = int(_listen.rsplit(":", 1)[1])
+    if str(CFG.get("gateway_key", "")).strip():
+        KEY = CFG["gateway_key"]
+
+
 def upstream_is_fixture() -> bool:
     """自测安全预检：从本目录 config.json 读上游基址，验明它真是夹具。
 
@@ -73,6 +91,9 @@ def main() -> int:
         return 3
 
     ok = True
+
+    # 幂等：先 reset 清掉上次残留的冷却/禁用状态，保证从干净起点开始
+    call("POST", "/api/guard/reset")
 
     status, data = call("GET", "/healthz")
     print("[1] healthz:", status, data.decode("utf-8", "replace")[:120])
@@ -132,6 +153,20 @@ def main() -> int:
     status, data = call("POST", "/v1/chat/completions",
                         {"model": "openclaw", "messages": [{"role": "user", "content": "after sentinel"}]})
     print("[11] sentinel cooldown -> local 503:", status, data.decode("utf-8", "replace")[:120])
+    ok &= status == 503
+
+    call("POST", "/api/guard/reset")
+    status, data = call("POST", "/v1/chat/completions",
+                        {"model": "openclaw", "messages": [{"role": "user", "content": "[[fixture:sentinel-stream]]"}],
+                         "stream": True})
+    print("[13] stream sentinel:", status, len(data), "bytes")
+    pieces = ("DANG", "EROU", "S_AC", "TIVI", "TY_B", "LOCK", "ED")
+    ok &= status == 200 and all(p.encode() in data for p in pieces) and b"[DONE]" in data
+
+    time.sleep(1.0)
+    status, data = call("POST", "/v1/chat/completions",
+                        {"model": "openclaw", "messages": [{"role": "user", "content": "after stream sentinel"}]})
+    print("[14] stream sentinel cooldown -> local 503:", status, data.decode("utf-8", "replace")[:120])
     ok &= status == 503
 
     status, data = call("GET", "/status")

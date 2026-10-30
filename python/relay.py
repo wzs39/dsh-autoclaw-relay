@@ -311,14 +311,18 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             try:
-                self._stream(reader)
+                hit = self._stream(reader, key)
             except Exception:  # noqa: BLE001
-                pass
+                hit = False
             finally:
                 try:
                     reader.close()
                 except Exception:  # noqa: BLE001
                     pass
+            if hit:
+                # 哨兵命中已在 _stream 内记 content_blocked；这里不能记 ok
+                # （guard 的 ok 会清掉 cooldown_until，等于白记）。
+                return
             st.record(key, "ok" if status == 200 else "error", f"HTTP {status}")
             return
 
@@ -399,18 +403,75 @@ class RelayHandler(BaseHTTPRequestHandler):
         msg = choices[0].get("message") or {}
         return str(msg.get("content") or "").strip() == CONTENT_BLOCK_SENTINEL
 
-    def _stream(self, reader) -> None:
-        """原样透传 SSE 字节。
+    def _stream(self, reader, key: str) -> bool:
+        """原样透传 SSE 字节，同时扫描内容哨兵。
 
         响应已声明 Connection: close 且无 Content-Length，客户端按 EOF 结束读取，
         因此这里写裸字节，不做 chunked 编码（否则客户端会把分块长度行当成正文）。
+
+        哨兵检测两条互补路径（上游可能整帧返回哨兵，也可能把哨兵拆进多个
+        delta 分片逐帧下发）：
+        1. 原始字节连续匹配（跨 8K 分块边界拼接尾块）；
+        2. 逐行解析 SSE 帧，累加 choices[0].delta.content，全等比对哨兵。
+        命中后记 content_blocked（本地冷却，不重试、不换号），当前流继续透传完
+        （adapter 侧已有文本兜底拦截），返回命中标记，调用方据此跳过 ok 记录。
         """
+        st = self.state
+        sentinel = CONTENT_BLOCK_SENTINEL
+        sentinel_b = sentinel.encode("utf-8")
+        hit = False
+        tail = b""
+        line_buf = b""
+        content = ""
         while True:
             chunk = reader.read(8192)
             if not chunk:
                 break
             self.wfile.write(chunk)
             self.wfile.flush()
+            if hit:
+                continue
+            # 路径 1：原始字节连续匹配
+            probe = tail + chunk
+            tail = probe[-(len(sentinel_b) - 1):] if len(sentinel_b) > 1 else b""
+            if sentinel_b in probe:
+                hit = True
+                st.record(key, "content_blocked", "stream sentinel (raw bytes)")
+                with st.lock:
+                    st.metrics["sentinel_hits"] = st.metrics.get("sentinel_hits", 0) + 1
+                LOG.warning("content sentinel hit in stream for account %s; stopped (no retry, no account switch)", key)
+                continue
+            # 路径 2：SSE 帧解析（行缓冲，处理跨块截断）
+            line_buf += chunk
+            while b"\n" in line_buf:
+                line, line_buf = line_buf.split(b"\n", 1)
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == b"[DONE]":
+                    continue
+                try:
+                    obj = json.loads(payload.decode("utf-8", "replace"))
+                except Exception:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0].get("delta") or {}).get("content") or ""
+                if not delta:
+                    continue
+                content += delta
+                if len(content) > 4096:
+                    content = content[-4096:]
+                if content.strip() == sentinel:
+                    hit = True
+                    st.record(key, "content_blocked", "stream sentinel (delta content)")
+                    with st.lock:
+                        st.metrics["sentinel_hits"] = st.metrics.get("sentinel_hits", 0) + 1
+                    LOG.warning("content sentinel hit in stream for account %s; stopped (no retry, no account switch)", key)
+                    break
+        return hit
 
     def _forward(self, method: str, path: str, body: bytes, stream: bool):
         st = self.state

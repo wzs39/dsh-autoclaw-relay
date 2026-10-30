@@ -14,7 +14,7 @@
     "base": "http://127.0.0.1:7890/internal/model-proxy",
     "path_prefix": "/v1",
     "path_map": {},
-    "fallback_on_406": true,
+    "fallback_on_406": false,
     "direct_mode": "model-proxy",
     "fallback_mode": "relay"
   },
