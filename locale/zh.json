@@ -1,0 +1,20 @@
+{
+  "title": "AutoClaw 中继",
+  "credits": "积分",
+  "account": "账号",
+  "region": "区域",
+  "cooldown": "冷却中",
+  "ready": "就绪",
+  "authBlocked": "凭据失效",
+  "checkinToday": "已签到",
+  "checkinPending": "未签到",
+  "requests": "请求",
+  "errors": "错误",
+  "enabled": "启用",
+  "disabled": "停用",
+  "noAccounts": "无账号",
+  "updated": "更新于",
+  "expiringSoon": "即将过期",
+  "dayBudget": "今日",
+  "upstreamDown": "上游不可达"
+}

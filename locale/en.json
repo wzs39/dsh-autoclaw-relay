@@ -1,0 +1,20 @@
+{
+  "title": "AutoClaw Relay",
+  "credits": "Credits",
+  "account": "Account",
+  "region": "Region",
+  "cooldown": "Cooldown",
+  "ready": "Ready",
+  "authBlocked": "Credential rejected",
+  "checkinToday": "Checked in",
+  "checkinPending": "Not checked in",
+  "requests": "Requests",
+  "errors": "Errors",
+  "enabled": "Enabled",
+  "disabled": "Disabled",
+  "noAccounts": "No accounts",
+  "updated": "Updated",
+  "expiringSoon": "Expiring",
+  "dayBudget": "Today",
+  "upstreamDown": "Upstream unreachable"
+}

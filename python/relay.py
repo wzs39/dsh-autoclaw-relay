@@ -37,6 +37,7 @@ from accounts import AccountManager  # noqa: E402
 from fingerprint import get_header, normalize_headers, strip_response_headers  # noqa: E402
 from guard import CONTENT_BLOCK_SENTINEL, CooldownGuard  # noqa: E402
 import checkin as checkin_mod  # noqa: E402
+import credits as credits_mod  # noqa: E402
 
 LOG = logging.getLogger("autoclaw-relay")
 
@@ -82,6 +83,7 @@ class RelayState:
         self.mode = cfg.get("upstream", {}).get("mode", "model-proxy")
         self.models_cache: dict[str, float] = {}
         self.models_cache_ttl = float(cfg.get("models_cache_ttl_s", 300))
+        self.credits_cache: dict | None = None
         self.metrics = {
             "requests": 0,
             "ok": 0,
@@ -94,6 +96,7 @@ class RelayState:
             "pacing_sleep_ms": 0,
             "failover_switches": 0,
             "checkin_count": 0,
+            "budget_blocked": 0,
         }
 
     def mode_spec(self) -> dict:
@@ -124,6 +127,36 @@ class RelayState:
         with self.lock:
             ts = self.models_cache.get("__t")
             return ts and (time.time() - ts) < self.models_cache_ttl
+
+    def credits_base(self) -> str:
+        """身份/积分网关基址（与模型上游分开：模型走上游反代，积分走官方身份网关）。"""
+        return (
+            self.cfg.get("credits_base")
+            or os.environ.get("AC_CREDITS_BASE")
+            or credits_mod.DEFAULT_BASE
+        )
+
+    def upstream_status(self) -> dict:
+        """上游可达性 —— 502 时用它一眼看出是上游死了还是请求本身有问题。"""
+        spec = self.mode_spec()
+        host, port, reachable, error = "", 0, False, ""
+        try:
+            split = urlsplit(spec["base"])
+            host = split.hostname or ""
+            port = split.port or (443 if split.scheme == "https" else 80)
+            import socket
+
+            with socket.create_connection((host, port), timeout=0.6):
+                reachable = True
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+        return {
+            "base": spec["base"],
+            "host": host,
+            "port": port,
+            "reachable": reachable,
+            "error": error,
+        }
 
     def resolve_account(self, requested: str | None) -> tuple[dict | None, str]:
         """解析账号：优先按请求指定的账号名，冷却时按 priority 故障转移。
@@ -275,7 +308,12 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         # ---- 免鉴权端点 ----
         if path == "/healthz":
-            self._send_json(200, {"ok": True, "mode": st.mode, "ts": time.time()})
+            self._send_json(200, {
+                "ok": True,
+                "mode": st.mode,
+                "ts": time.time(),
+                "upstream": st.upstream_status(),
+            })
             return
         if path == "/status":
             self._send_json(200, {
@@ -283,6 +321,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "guard": st.guard.status(),
                 "metrics": st.metrics,
                 "accounts": st.accounts.list_accounts(),
+                "upstream": st.upstream_status(),
             })
             return
         if path == "/metrics":
@@ -312,6 +351,14 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "checkin": checkin_blob,
                 "ts": time.time(),
             })
+            return
+
+        # ---- 账号与积分（只读展示，免 gateway key：插件 UI 与本地看板直接用）----
+        if path in ("/api/account", "/api/credits"):
+            self._send_readonly_account()
+            return
+        if path == "/api/usage":
+            self._send_usage()
             return
 
         # ---- 需要 gateway key 的端点 ----
@@ -388,6 +435,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         if path == "/api/guard/reset":
             self._send_json(200, st.guard.reset())
             return
+        if path == "/api/guard/auth-recovered":
+            # 人工重新登录后调用：只解 auth 类禁用，不碰 403/429/内容类冷却。
+            self._send_json(200, st.guard.auth_recovered())
+            return
 
         # ---- 转发请求：解析账号 + 故障转移 ----
         # 从请求头或 body 里取账号名
@@ -423,7 +474,31 @@ class RelayHandler(BaseHTTPRequestHandler):
             with st.lock:
                 st.metrics["blocked_rejections"] += 1
             self._drain_body()
+            # 区分"凭据失效被禁用"与"冷却中"：前者人工重登才能解，后者等时间。
+            disabled = [
+                k for k, v in (st.guard.status().get("accounts") or {}).items()
+                if v.get("disabled") and v.get("disable_kind") == "auth"
+            ]
+            if disabled:
+                self._send_json(503, {
+                    "error": {
+                        "message": "account credential rejected; stopped sending traffic",
+                        "type": "auth_disabled",
+                        "accounts": disabled,
+                        "hint": "重新登录官方客户端后用 POST /api/guard/auth-recovered 解除",
+                    },
+                })
+                return
             self._send_json(503, {"error": {"message": "all accounts in cooldown", "type": "cooldown"}})
+            return
+
+        # 日预算闸：超预算直接拒，不打上游
+        over, why = st.guard.budget_exceeded(acc_key)
+        if over:
+            with st.lock:
+                st.metrics["budget_blocked"] = st.metrics.get("budget_blocked", 0) + 1
+            self._drain_body()
+            self._send_json(503, {"error": {"message": why, "type": "daily_budget"}})
             return
 
         # 上游 Z.AI 限制 tools 最多 64 条
@@ -452,14 +527,44 @@ class RelayHandler(BaseHTTPRequestHandler):
         try:
             status, resp_headers, reader = self._forward(method, path, body, stream, account_cfg)
         except UpstreamError as e:
-            if e.status in (429, 402, 401, 406):
+            if e.kind == "transport":
+                # 连不上 ≠ 账号异常：只记 transport，不扣信誉、不进冷却。
+                st.record(acc_key, "transport", e.detail)
+            elif e.status in (429, 402, 401, 406):
                 kind = {429: "rate", 402: "balance", 401: "auth", 406: "error"}[e.status]
                 st.record(acc_key, kind, e.detail)
+            if e.status in (0, 502):
+                up = st.upstream_status()
+                self._send_json(502, {
+                    "error": {
+                        "message": e.detail,
+                        "type": "upstream_unreachable",
+                        "hint": (
+                            f"上游 {up['host']}:{up['port']} 不可达；确认 AutoClaw 桌面客户端在运行，"
+                            f"其本地代理端口与 upstream.base 一致，或把 upstream.mode 改成 openai 并指向可用上游"
+                        ),
+                        "upstream": up,
+                    },
+                })
+                return
             self._send_json(e.status or 502, {"error": {"message": e.detail, "type": "upstream_error"}})
             return
         except Exception as e:  # noqa: BLE001
-            st.record(acc_key, "error", f"upstream transport: {type(e).__name__}")
-            self._send_json(502, {"error": {"message": f"upstream transport error: {type(e).__name__}", "type": "upstream_error"}})
+            st.record(acc_key, "transport", f"upstream transport: {type(e).__name__}")
+            up = st.upstream_status()
+            hint = (
+                f"上游 {up['host']}:{up['port']} 不可达（{type(e).__name__}）"
+                f"；确认 AutoClaw 桌面客户端在运行且其本地代理端口与 upstream.base 一致，"
+                f"或把 upstream.mode 改成 openai 并指向可用上游"
+            )
+            self._send_json(502, {
+                "error": {
+                    "message": f"upstream connect failed: {type(e).__name__}: {e}",
+                    "type": "upstream_unreachable",
+                    "hint": hint,
+                    "upstream": up,
+                },
+            })
             return
 
         ctype = get_header(resp_headers, "Content-Type", "application/json")
@@ -526,6 +631,72 @@ class RelayHandler(BaseHTTPRequestHandler):
                 with st.lock:
                     st.metrics["upstream_406"] += 1
                 self._maybe_fallback_on_406()
+
+    # ---------- 账号与积分（只读） ----------
+    def _credits_payload(self) -> dict:
+        """账号 + 积分，带 TTL 缓存（避免卡片轮询把上游打成异常流量）。"""
+        st = self.state
+        ttl = float(st.cfg.get("credits_cache_ttl_s", 300))
+        with st.lock:
+            cached = st.credits_cache
+            fresh = cached is not None and (time.time() - cached["at"]) < ttl
+        if fresh:
+            return cached["payload"]
+        payload = credits_mod.snapshot(base=st.credits_base())
+        with st.lock:
+            st.credits_cache = {"at": time.time(), "payload": payload}
+        return payload
+
+    def _send_readonly_account(self) -> None:
+        try:
+            self._send_json(200, self._credits_payload())
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {
+                "error": {"message": f"{type(exc).__name__}: {exc}", "type": "credits_error"},
+            })
+
+    def _send_usage(self) -> None:
+        """插件客户端卡片用的聚合视图：账号 + 积分 + 守卫 + 指标。
+
+        积分这一路失败不影响账号/守卫状态回传 —— 卡片不该整块消失。
+        """
+        st = self.state
+        try:
+            credits = self._credits_payload()
+        except Exception as exc:  # noqa: BLE001
+            credits = {"total": 0, "accounts": [], "error": f"{type(exc).__name__}: {exc}"}
+        guard = st.guard.status()
+        accounts = []
+        by_key = {a["account"]: a for a in credits.get("accounts") or []}
+        for name in st.accounts.names():
+            acc = st.accounts.get(name) or {}
+            g = (guard.get("accounts") or {}).get(name, {})
+            cred = next(iter(by_key.values()), {}) if len(by_key) == 1 else {}
+            accounts.append({
+                "name": name,
+                "region": acc.get("region", "cn"),
+                "enabled": acc.get("enabled", True),
+                "primary": name == st.cfg.get("account_key", "default"),
+                "credits": cred.get("total"),
+                "phone": cred.get("phone"),
+                "uid": cred.get("uid"),
+                "checkedIn": cred.get("checkedIn"),
+                "expiring": cred.get("expiring"),
+                "cooldown_remaining_s": g.get("cooldown_remaining_s", 0),
+                "disabled": g.get("disabled", False),
+                "disable_kind": g.get("disable_kind", ""),
+                "day_total": g.get("day_total", 0),
+            })
+        self._send_json(200, {
+            "ts": int(time.time()),
+            "ok": True,
+            "total": credits.get("total", 0),
+            "accounts": accounts,
+            "guard": guard,
+            "metrics": st.metrics,
+            "upstream": st.upstream_status(),
+            **({"creditsError": credits["error"]} if credits.get("error") else {}),
+        })
 
     # ---------- 上游转发 ----------
     def _maybe_fallback_on_406(self) -> None:
@@ -655,7 +826,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             resp = conn.getresponse()
         except Exception as e:  # noqa: BLE001
             conn.close()
-            raise UpstreamError("error", f"upstream connect failed: {type(e).__name__}") from e
+            # 本地/网络层连不上 ≠ 账号异常：单独归类，不累计 fail_streak，
+            # 否则"客户端没开"会被记成"账号连续失败"，白送一次冷却。
+            raise UpstreamError("transport", f"upstream connect failed: {type(e).__name__}") from e
 
         if resp.status >= 400:
             snippet = resp.read(2048).decode("utf-8", "replace")

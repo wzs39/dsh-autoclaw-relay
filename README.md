@@ -74,18 +74,70 @@ DSH (模型选择器: AutoClaw 中继)
 | `GET /api/guard/status` | 冷却剩余秒数 |
 | `POST /api/guard/reset` | 人工解除冷却/禁用（401 禁用后必须走这里） |
 
+## 账号与积分（只读）
+
+网关直接读**本机官方客户端已登录账号**，解 `account-credentials.enc`
+（Electron safeStorage = Chromium os_crypt：DPAPI 保护 AES 密钥 + v10 AES-256-GCM 信封），
+再按官方中间件头签名（`X-Auth-Sign = md5(appId&ts&appKey)`）调只读接口。
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /api/account`、`GET /api/credits` | 账号 + 积分（总积分、各钱包分桶、即将过期、签到状态） |
+| `GET /api/usage` | 插件卡片用聚合视图：账号 + 积分 + 守卫 + metrics + 上游可达性 |
+| `autoclaw_account`（模型工具） | agent 可调用的同一份数据 |
+
+数据带 5 分钟缓存（`credits_cache_ttl_s`），避免看板轮询把上游打成异常流量。
+CLI 直查：`python credits.py` / `python credits.py --json`。
+
+## 防封（对齐历史事故教训）
+
+来自 `deepseek-web-bridge/guard-policy.md` 的真实封禁复盘，逐条落到代码：
+
+| 教训 | 落实 |
+| --- | --- |
+| **被拒后继续敲门是封禁主因** | 401/auth 类失败 → `disabled` + `disable_kind=auth`，主流程直接 503，**不打上游** |
+| **熔断状态必须落盘，重启不能失忆** | `guard-state.json` 原子写；状态结构带 `disable_kind`，重启后仍生效 |
+| **`#save()` 静默失败会让熔断形同虚设** | 写盘失败不再吞异常：记 `state_error` 并打到 stderr，`/api/usage` 暴露 `state_writable` |
+| **凭据失效只能人工解决** | `reset` **不解 auth 禁用**；必须 `POST /api/guard/auth-recovered`（语义=我重登了） |
+| **新号/长期要低负载** | `daily_budget` 日预算闸，超额本地 503 |
+| **人类有作息，夜间该低流量** | `quiet_hours` + `quiet_hours_factor`，夜间间隔按倍数放大 |
+| **不追加重试** | 插件层 `noRetry` 默认开（`maxRetries=0`） |
+| **本地连不上 ≠ 账号异常** | 连接失败归 `transport`，只计数**不扣信誉、不冷却**（否则"客户端没开"会被记成"账号连续失败"） |
+
+### 当前生效参数（`~/.dsh/autoclaw-relay/config.json`）
+
+```json
+"guard": {
+  "min_interval_ms": 6000,
+  "max_interval_ms": 18000,
+  "daily_budget": 80,
+  "quiet_hours": "0-7",
+  "quiet_hours_factor": 4.0,
+  "error_threshold": 3,
+  "cooldown_repeated_errors": 600,
+  "cooldown_auth_failed": null
+}
+```
+
 ## 故障排查
 
-- **模型调用报 `TRANSPORT` 连接失败** → relay 没起来：看 `~/.dsh/autoclaw-relay/relay.log`；手动验证 `python relay.py -c <config> --check`。
-- **报 `HTTP 503: local cooldown`** → 正常防封行为，等冷却或 `POST /api/guard/reset`（401 禁用必须人工 reset）。
-- **模型目录为空** → relay 没就绪或上游 `/v1/models` 失败；在设置页点「检测模型」重拉，或在 `models` 配置里写静态清单。
+- **模型调用报 `upstream_unreachable`** → 响应里直接带 `upstream.host/port/reachable` 和 `hint`，
+  不再是一句裸的 `ConnectionRefusedError`；`GET /healthz` 也会报告上游可达性。
+- **报 `HTTP 503: auth_disabled`** → 凭据被上游拒绝。重新登录官方客户端后
+  `POST /api/guard/auth-recovered`（`reset` 故意不解这一类）。
+- **报 `HTTP 503: daily_budget`** → 日预算用满，等次日或调高 `daily_budget`。
+- **积分显示 0 或 `creditsError`** → 客户端未登录 / 凭据解密失败；CLI 跑 `python credits.py` 看具体原因。
 - **端口冲突** → 改 `config.json` 的 `listen`，插件每次请求现读端点，即时生效。
 - **Python 找不到** → `pythonPath` 填绝对路径。
 
 ## 文件布局
 
 ```
-lib/index.js            入口：配置、进程托管、提供方注册、每日签到
+lib/index.js            入口：配置、进程托管、提供方注册、账号/积分工具、usage 路由
+lib/client.js           客户端卡片：积分 / 账号 / 冷却 / 到期提醒 / 日预算用量
 lib/openai-adapter.js   DSH ↔ OpenAI 适配器（SSE 解析、工具调用、哨兵拦截、并发闸门）
-python/                 AutoClaw 中继网关（纯 Python 3.10+ 标准库，10 个文件原样打包）
+python/credits.py       账号与积分（DPAPI 解密 + 官方签名 + 只读接口）
+python/guard.py         冷却状态机 / 节流 / 日预算 / 作息曲线
+python/relay.py         网关主程序
 ```
+
