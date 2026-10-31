@@ -288,6 +288,31 @@ class RelayHandler(BaseHTTPRequestHandler):
         if path == "/metrics":
             self._send_json(200, st.metrics)
             return
+        if path == "/api/usage":
+            """免 key 的 usage 文档：账号列表（脱敏）+ 冷却 + 签到状态。
+            供插件客户端 half 轮询显示账号和积分。"""
+            accounts = []
+            for acc in st.accounts.list_accounts():
+                accounts.append({
+                    "name": acc.get("name"),
+                    "region": acc.get("region", "cn"),
+                    "enabled": acc.get("enabled", True),
+                    "priority": acc.get("priority", 0),
+                    "created_at": acc.get("created_at"),
+                })
+            state_path = st.cfg.get("checkin_state_path") or os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "data", "checkin-state.json"
+            )
+            checkin_blob = checkin_mod.load_state(state_path)
+            self._send_json(200, {
+                "mode": st.mode,
+                "accounts": accounts,
+                "guard": st.guard.status(),
+                "metrics": st.metrics,
+                "checkin": checkin_blob,
+                "ts": time.time(),
+            })
+            return
 
         # ---- 需要 gateway key 的端点 ----
         if not self._require_key():

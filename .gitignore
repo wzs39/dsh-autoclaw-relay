@@ -15,3 +15,6 @@ data/
 *.egg-info/
 .venv/
 venv/
+python/config.json
+python/data/
+*.esm-broken
